@@ -1,6 +1,8 @@
 const TronWeb = require('tronweb');
+const dotenv = require("dotenv");
+console.log(process.env.TRON_NODE_URL)
 const tronWeb = new TronWeb.TronWeb({
-    fullHost: "https://api.shasta.trongrid.io",
+    fullHost: 'https://api.trongrid.io',
   });
   
 const account = TronWeb.utils.accounts.generateAccount();

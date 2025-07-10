@@ -33,7 +33,7 @@ class TronWalletManager {
       return {
         address: account.address.base58,
         hexAddress: account.address.hex,
-        privateKey: await encrypt(account.privateKey, process.env.ENCRYPTION_KEY)
+        privateKey: account.privateKey
       };
     } catch (error) {
       console.error('Error generating address:', error);

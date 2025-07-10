@@ -15,6 +15,8 @@ const indexEntity = require("./src/domain/trader_wallet_index");
 const TronWallet = require("./src/infra/tronWallet");
 const Trc20Service = require("./src/infra/trc20Service");
 const TronWebhooks = require("./src/infra/tronWebhooks.js");
+const { Not } = require("typeorm");
+
 
 const app = express();
 app.use(express.json());
@@ -42,7 +44,7 @@ AppDataSource.initialize().then(() => {
   const txRepo = AppDataSource.getRepository("WalletTransaction");
 
   // Инициализация вебхуков
-  // const tronWebhooks = new TronWebhooks(tronWeb); // Передаем экземпляр tronWeb
+  //  const tronWebhooks = new TronWebhooks(tronWeb); // Передаем экземпляр tronWeb
 
   // Генерация TRON-кошелька для трейдера
   app.post("/wallets/create", async (req, res) => {
@@ -149,50 +151,85 @@ AppDataSource.initialize().then(() => {
 
   // Разморозка и перевод средств (off-chain)
   app.post("/wallets/release", async (req, res) => {
-    const { traderId, orderId, rewardPercent = 0.01 } = req.body;
-
+    const { traderId, orderId, rewardPercent = 0.01, platformFee = 0.02, merchantId } = req.body;
+  
     try {
-      const wallet = await walletRepo.findOneBy({ traderId, currency: "USDT" });
-      if (!wallet) return res.status(404).json({ error: "Wallet not found" });
-
+      // Трейдерский кошелёк
+      const traderWallet = await walletRepo.findOneBy({ traderId, currency: "USDT" });
+      if (!traderWallet) return res.status(404).json({ error: "Trader wallet not found" });
+  
+      // Замороженная транзакция
       const freezeTx = await txRepo.findOneBy({ orderId, type: "freeze" });
-      if (!freezeTx) return res.status(404).json({ error: "No frozen transaction found" });
-
+      if (!freezeTx) return res.status(404).json({ error: "Freeze transaction not found" });
+  
       const amount = freezeTx.amount;
       const reward = parseFloat((amount * rewardPercent).toFixed(6));
-
-      wallet.frozen -= amount;
-      if (wallet.frozen < 0) wallet.frozen = 0
-      wallet.balance += reward;
-      await walletRepo.save(wallet);
-
-      await txRepo.save(
-        txRepo.create({
-          traderId,
-          currency: "USDT",
-          type: "release",
-          amount,
-          orderId,
-          status: "confirmed",
-        })
-      );
-
-      await txRepo.save(
-        txRepo.create({
-          traderId,
-          currency: "USDT",
-          type: "reward",
-          amount: reward,
-          status: "confirmed",
-        })
-      );
-
-      return res.json({ released: amount, reward });
+      const platformCut = parseFloat((amount * platformFee).toFixed(6));
+      const merchantAmount = parseFloat((amount - reward - platformCut).toFixed(6));
+  
+      // Списываем с замороженного трейдера и начисляем награду
+      traderWallet.frozen -= amount;
+      if (traderWallet.frozen < 0) traderWallet.frozen = 0;
+      traderWallet.balance += reward;
+      await walletRepo.save(traderWallet);
+  
+      // Логируем трейдерские транзакции
+      await txRepo.save(txRepo.create({
+        traderId,
+        currency: "USDT",
+        type: "release",
+        amount,
+        orderId,
+        status: "confirmed",
+      }));
+  
+      await txRepo.save(txRepo.create({
+        traderId,
+        currency: "USDT",
+        type: "reward",
+        amount: reward,
+        status: "confirmed",
+      }));
+  
+      // Находим кошелёк мерчанта
+      const merchantWallet = await walletRepo.findOneBy({ traderId: merchantId, currency: "USDT" });
+      if (!merchantWallet) return res.status(404).json({ error: "Merchant wallet not found" });
+  
+      merchantWallet.balance += merchantAmount;
+      await walletRepo.save(merchantWallet);
+  
+      // Логируем мерчантскую транзакцию
+      await txRepo.save(txRepo.create({
+        traderId: merchantId,
+        currency: "USDT",
+        type: "merchant_income",
+        amount: merchantAmount,
+        orderId,
+        status: "confirmed",
+      }));
+  
+      // Логируем platform fee
+      await txRepo.save(txRepo.create({
+        traderId, // можно traderId или специальный "platform" ID, если он у тебя есть
+        currency: "USDT",
+        type: "platform_fee",
+        amount: platformCut,
+        orderId,
+        status: "confirmed",
+      }));
+  
+      return res.json({
+        released: amount,
+        reward,
+        merchantReceived: merchantAmount,
+        platformFee: platformCut,
+      });
     } catch (error) {
       console.error("Error releasing funds:", error);
       return res.status(500).json({ error: "Failed to release funds" });
     }
   });
+  
 
   // Вывод USDT (on-chain)
   app.post("/wallets/withdraw", async (req, res) => {
@@ -208,24 +245,33 @@ AppDataSource.initialize().then(() => {
         return res.status(404).json({ error: "Wallet not found" });
       }
   
-      // Проверяем баланс (off-chain)
+      // Проверка off-chain баланса
       if (wallet.balance < amount) {
         return res.status(400).json({ error: "Insufficient balance" });
       }
   
-      // Отправляем транзакцию в блокчейн
+      // Получаем custody-кошелёк платформы
+      const platformWallet = await walletRepo.findOneBy({
+        traderId: "platform",
+        currency: "USDT",
+      });
+      if (!platformWallet) {
+        return res.status(500).json({ error: "Platform wallet not configured" });
+      }
+  
+      // Отправка USDT с платформенного кошелька
       const txHash = await Trc20Service.transfer(
-        wallet.address,
+        platformWallet.address,
         toAddress,
         amount,
-        wallet.privateKey
+        platformWallet.privateKey
       );
   
-      // Обновляем баланс
+      // Списываем off-chain баланс у пользователя
       wallet.balance -= amount;
       await walletRepo.save(wallet);
   
-      // Сохраняем транзакцию
+      // Логируем в wallet_transactions
       await txRepo.save(
         txRepo.create({
           traderId,
@@ -240,12 +286,13 @@ AppDataSource.initialize().then(() => {
       return res.json({ txHash });
     } catch (error) {
       console.error("Withdraw error:", error);
-      return res.status(500).json({ 
+      return res.status(500).json({
         error: "Withdraw failed",
-        details: error.message || error.toString() 
+        details: error.message || error.toString(),
       });
     }
   });
+  
 
   // История операций
   app.get("/wallets/:traderId/history", async (req, res) => {
@@ -292,7 +339,8 @@ AppDataSource.initialize().then(() => {
     try {
       const wallet = await walletRepo.findOneBy({ traderId, currency: "USDT" });
       if (!wallet) return res.status(404).json({ error: "Wallet not found" });
-  
+
+      console.log(wallet.address)
       const balance = await Trc20Service.getBalance(wallet.address);
       res.json({ balance });
     } catch (error) {
@@ -334,6 +382,36 @@ AppDataSource.initialize().then(() => {
     }
   });
 
+  app.post("/wallets/reward-stats", async (req, res) => {
+    const { traderId, from, to } = req.body;
+  
+    if (!traderId || !from || !to) {
+      return res.status(400).json({ error: "Missing traderId, from, or to" });
+    }
+  
+    try {
+      const result = await txRepo
+        .createQueryBuilder("tx")
+        .select("SUM(tx.amount)", "total")
+        .where("tx.traderId = :traderId", { traderId })
+        .andWhere("tx.type = :type", { type: "reward" })
+        .andWhere("tx.createdAt BETWEEN :from AND :to", { from, to })
+        .getRawOne();
+  
+      const total = result.total || 0;
+  
+      return res.json({
+        traderId,
+        from,
+        to,
+        rewardEarned: parseFloat(total),
+      });
+    } catch (error) {
+      console.error("Error calculating reward stats:", error);
+      return res.status(500).json({ error: "Failed to calculate reward stats" });
+    }
+  });  
+
   // Запуск сервера
   const PORT = process.env.PORT || 3000;
   app.listen(PORT, () => {
@@ -343,3 +421,6 @@ AppDataSource.initialize().then(() => {
 }).catch(error => {
   console.error("Database connection failed:", error);
 });
+
+const startDepositForwarding = require('./src/infra/depositForwarder');
+startDepositForwarding({ tronWeb, dataSource: AppDataSource });

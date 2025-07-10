@@ -1,10 +1,7 @@
-// src/infra/cryptoUtils.js
 const crypto = require('crypto');
 const algorithm = 'aes-256-cbc';
 
-/**
- * Шифрование данных
- */
+
 function encrypt(text, key) {
   const iv = crypto.randomBytes(16);
   const cipher = crypto.createCipheriv(algorithm, Buffer.from(key, 'hex'), iv);
@@ -13,9 +10,6 @@ function encrypt(text, key) {
   return `${iv.toString('hex')}:${encrypted.toString('hex')}`;
 }
 
-/**
- * Дешифрование данных
- */
 function decrypt(encryptedText, key) {
   const [ivHex, encryptedHex] = encryptedText.split(':');
   const iv = Buffer.from(ivHex, 'hex');
@@ -26,9 +20,6 @@ function decrypt(encryptedText, key) {
   return decrypted.toString();
 }
 
-/**
- * Генерация хеша SHA-256
- */
 function hash(data) {
   return crypto.createHash('sha256').update(data).digest('hex');
 }
