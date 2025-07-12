@@ -1,6 +1,7 @@
 const express = require("express");
 const { DataSource } = require("typeorm");
 const dotenv = require("dotenv");
+const { topUpIfNeeded } = require('./src/infra/trxTopUpService');
 dotenv.config();
 
 const TronWeb = require('tronweb');
@@ -410,7 +411,15 @@ AppDataSource.initialize().then(() => {
       console.error("Error calculating reward stats:", error);
       return res.status(500).json({ error: "Failed to calculate reward stats" });
     }
-  });  
+  });
+
+  // setInterval(async () => {
+  //   const wallets = await walletRepo.find({
+  //     where: { traderId: Not('platform'), currency: 'USDT' },
+  //   });
+  
+  //   await topUpIfNeeded(wallets);
+  // }, 30000); // каждые 30 секунд
 
   // Запуск сервера
   const PORT = process.env.PORT || 3000;
