@@ -86,7 +86,7 @@ async transfer(fromAddress, toAddress, amount, privateKey) {
     const account = await tronWebWithPK.trx.getAccount(fromAddress);
     console.log('→ Platform account info:', account);
     const tx = await contractWithPK.transfer(toAddress, amountInSun).send({
-      feeLimit: 10_000_000
+      feeLimit: 50_000_000
     });
 
     console.log(`✅ Sent! txHash: ${tx}`);
