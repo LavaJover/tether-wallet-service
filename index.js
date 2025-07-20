@@ -16,6 +16,7 @@ const indexEntity = require("./src/domain/trader_wallet_index");
 const TronWallet = require("./src/infra/tronWallet");
 const Trc20Service = require("./src/infra/trc20Service");
 const TronWebhooks = require("./src/infra/tronWebhooks.js");
+const withdrawalRuleEntity = require("./src/domain/withdrawal_rule.js");
 const { Not } = require("typeorm");
 
 
@@ -34,7 +35,7 @@ const AppDataSource = new DataSource({
   password: process.env.DB_PASS,
   database: process.env.DB_NAME,
   synchronize: true,
-  entities: [walletEntity, transactionEntity, indexEntity],
+  entities: [walletEntity, transactionEntity, indexEntity, withdrawalRuleEntity],
 });
 
 AppDataSource.initialize().then(() => {
@@ -43,6 +44,7 @@ AppDataSource.initialize().then(() => {
   const walletRepo = AppDataSource.getRepository("Wallet");
   const indexRepo = AppDataSource.getRepository("TraderWalletIndex");
   const txRepo = AppDataSource.getRepository("WalletTransaction");
+  const ruleRepo = AppDataSource.getRepository("WithdrawalRule");
 
   // Инициализация вебхуков
   //  const tronWebhooks = new TronWebhooks(tronWeb); // Передаем экземпляр tronWeb
@@ -276,9 +278,46 @@ AppDataSource.initialize().then(() => {
         return res.status(404).json({ error: "Wallet not found" });
       }
   
-      // Проверка off-chain баланса
-      if (wallet.balance < amount) {
-        return res.status(400).json({ error: "Insufficient balance" });
+      // Получаем правило вывода для трейдера (если есть)
+      const rule = await ruleRepo.findOneBy({ traderId });
+  
+      // Проверяем правило, если оно есть
+      if (rule) {
+        // Проверка минимальной суммы
+        if (parseFloat(amount) < parseFloat(rule.minAmount)) {
+          return res.status(400).json({ error: `Amount below minimum withdrawal limit of ${rule.minAmount}` });
+        }
+  
+        // Проверка комиссии: учитываем, что баланс должен покрывать сумму + фикс. комиссию
+        const totalAmount = parseFloat(amount) + parseFloat(rule.fixedFee || 0);
+        if (wallet.balance < totalAmount) {
+          return res.status(400).json({ error: "Insufficient balance including withdrawal fee" });
+        }
+  
+        // Проверка интервала между выводами (cooldown)
+        if (rule.cooldownSeconds > 0) {
+          const lastTx = await txRepo.findOne({
+            where: { traderId, type: "withdraw" },
+            order: { createdAt: "DESC" },
+          });
+  
+          if (lastTx) {
+            const now = new Date();
+            const lastTime = new Date(lastTx.createdAt);
+            const diffSeconds = (now - lastTime) / 1000;
+  
+            if (diffSeconds < rule.cooldownSeconds) {
+              return res.status(400).json({
+                error: `Cooldown active. Please wait ${Math.ceil(rule.cooldownSeconds - diffSeconds)} seconds before next withdrawal.`,
+              });
+            }
+          }
+        }
+      } else {
+        // Если правила нет, проверяем просто баланс >= amount
+        if (wallet.balance < parseFloat(amount)) {
+          return res.status(400).json({ error: "Insufficient balance" });
+        }
       }
   
       // Получаем custody-кошелёк платформы
@@ -290,7 +329,7 @@ AppDataSource.initialize().then(() => {
         return res.status(500).json({ error: "Platform wallet not configured" });
       }
   
-      // Отправка USDT с платформенного кошелька
+      // Выполняем перевод с платформенного кошелька — **сумму без комиссии**, комиссия снимается оффчейн
       const txHash = await Trc20Service.transfer(
         platformWallet.address,
         toAddress,
@@ -298,11 +337,15 @@ AppDataSource.initialize().then(() => {
         platformWallet.privateKey
       );
   
-      // Списываем off-chain баланс у пользователя
-      wallet.balance -= amount;
+      // Списываем баланс с учетом комиссии, если правило есть
+      if (rule) {
+        wallet.balance -= totalAmount; // amount + fixedFee
+      } else {
+        wallet.balance -= parseFloat(amount);
+      }
       await walletRepo.save(wallet);
   
-      // Логируем в wallet_transactions
+      // Логируем транзакцию вывода с суммой (без комиссии)
       await txRepo.save(
         txRepo.create({
           traderId,
@@ -323,7 +366,6 @@ AppDataSource.initialize().then(() => {
       });
     }
   });
-  
 
   // История операций
   app.get("/wallets/:traderId/history", async (req, res) => {
@@ -443,6 +485,58 @@ AppDataSource.initialize().then(() => {
     }
   });
 
+  app.post('/admin/withdrawal-rules', async (req, res) => {
+    const { traderId, fixedFee, minAmount, cooldownSeconds } = req.body;
+    if (!traderId) return res.status(400).json({ error: "traderId is required" });
+  
+    try {
+      let rule = await ruleRepo.findOneBy({ traderId });
+      if (!rule) {
+        rule = ruleRepo.create({ traderId, fixedFee, minAmount, cooldownSeconds });
+      } else {
+        rule.fixedFee = fixedFee ?? rule.fixedFee;
+        rule.minAmount = minAmount ?? rule.minAmount;
+        rule.cooldownSeconds = cooldownSeconds ?? rule.cooldownSeconds;
+      }
+  
+      await ruleRepo.save(rule);
+      res.json({ success: true, rule });
+    } catch (e) {
+      console.error('Error setting withdrawal rule:', e);
+      res.status(500).json({ error: e.message });
+    }
+  }); 
+
+  app.get("/withdrawal-rules/:traderId", async (req, res) => {
+    const { traderId } = req.params;
+  
+    try {
+      const rule = await ruleRepo.findOneBy({ traderId });
+      if (!rule) {
+        return res.status(404).json({ error: "Rule not found" });
+      }
+      res.json(rule);
+    } catch (error) {
+      console.error("Error fetching withdrawal rule:", error);
+      res.status(500).json({ error: "Failed to fetch withdrawal rule" });
+    }
+  });
+  
+  app.delete("/withdrawal-rules/:traderId", async (req, res) => {
+    const { traderId } = req.params;
+  
+    try {
+      const result = await ruleRepo.delete({ traderId });
+      if (result.affected === 0) {
+        return res.status(404).json({ error: "Rule not found" });
+      }
+      res.json({ message: "Rule deleted successfully" });
+    } catch (error) {
+      console.error("Error deleting withdrawal rule:", error);
+      res.status(500).json({ error: "Failed to delete withdrawal rule" });
+    }
+  });
+  
   // setInterval(async () => {
   //   const wallets = await walletRepo.find({
   //     where: { traderId: Not('platform'), currency: 'USDT' },
@@ -461,5 +555,5 @@ AppDataSource.initialize().then(() => {
   console.error("Database connection failed:", error);
 });
 
-const startDepositForwarding = require('./src/infra/depositForwarder');
-startDepositForwarding({ tronWeb, dataSource: AppDataSource });
+// const startDepositForwarding = require('./src/infra/depositForwarder');
+// startDepositForwarding({ tronWeb, dataSource: AppDataSource });
