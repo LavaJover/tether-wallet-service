@@ -119,15 +119,42 @@ AppDataSource.initialize().then(() => {
     }
   });
 
+  app.post("/wallets/offchain-withdraw", async (req, res) => {
+    const { traderId, amount, txHash } = req.body;
+    try {
+      const wallet = await walletRepo.findOneBy({ traderId, currency: "USDT" });
+      if (!wallet) return res.status(404).json({ error: "Wallet not found" });
+
+      wallet.balance -= amount;
+      await walletRepo.save(wallet);
+      console.log(`off-chain withdraw: ${amount}. Wallet balance: ${wallet.balance}`)
+
+      const tx = txRepo.create({
+        traderId,
+        currency: "USDT",
+        type: "off-chain withdraw",
+        amount,
+        txHash,
+        status: "confirmed",
+      });
+      await txRepo.save(tx);
+
+      return res.json({ success: true });
+    } catch (error) {
+      console.error("Error processing off-chain withdraw:", error);
+      return res.status(500).json({ error: "Failed to process off-chain withdraw" });
+    }
+  });
+
   // Заморозка средств под заказ
   app.post("/wallets/freeze", async (req, res) => {
     const { traderId, amount, orderId } = req.body;
 
     try {
       const wallet = await walletRepo.findOneBy({ traderId, currency: "USDT" });
-      if (!wallet || wallet.balance < amount) {
-        return res.status(400).json({ error: "Insufficient balance" });
-      }
+      // if (!wallet || wallet.balance < amount) {
+      //   return res.status(400).json({ error: "Insufficient balance" });
+      // }
 
       wallet.balance -= amount;
       wallet.frozen += amount;
@@ -160,7 +187,10 @@ AppDataSource.initialize().then(() => {
       if (!traderWallet) return res.status(404).json({ error: "Trader wallet not found" });
   
       // Замороженная транзакция
-      const freezeTx = await txRepo.findOneBy({ orderId, type: "freeze" });
+      const freezeTx = await txRepo.findOne({
+        where: { orderId, type: "freeze" },
+        order: { createdAt: "DESC" }, 
+      });      
       if (!freezeTx) return res.status(404).json({ error: "Freeze transaction not found" });
   
       const amount = freezeTx.amount;
