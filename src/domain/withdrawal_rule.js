@@ -15,15 +15,11 @@ module.exports = new EntitySchema({
       unique: true,
     },
     fixedFee: {
-      type: 'decimal',
-      precision: 24,
-      scale: 6,
+      type: 'float',
       default: 0,
     },
     minAmount: {
-      type: 'decimal',
-      precision: 24,
-      scale: 6,
+      type: 'float',
       default: 0,
     },
     cooldownSeconds: {
