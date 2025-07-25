@@ -198,7 +198,7 @@ AppDataSource.initialize().then(() => {
       const amount = freezeTx.amount;
       const reward = parseFloat((amount * rewardPercent).toFixed(6));
       const platformCut = parseFloat((amount * platformFee).toFixed(6));
-      const merchantAmount = parseFloat((amount - reward - platformCut).toFixed(6));
+      const merchantAmount = parseFloat((amount - platformCut).toFixed(6));
   
       // Списываем с замороженного трейдера и начисляем награду
       traderWallet.frozen -= amount;
@@ -370,14 +370,39 @@ AppDataSource.initialize().then(() => {
   // История операций
   app.get("/wallets/:traderId/history", async (req, res) => {
     const { traderId } = req.params;
+    
+    // Параметры пагинации с значениями по умолчанию
+    const page = parseInt(req.query.page) || 1;
+    const limit = parseInt(req.query.limit) || 10;
+    const offset = (page - 1) * limit;
   
     try {
-      const transactions = await txRepo.find({
-        where: { traderId },
+      // Запрос данных с пагинацией и фильтрацией
+      const [transactions, total] = await txRepo.findAndCount({
+        where: {
+          traderId,
+          type: Not("platform_fee") // Исключаем platform_fee
+        },
         order: { createdAt: "DESC" },
+        skip: offset,
+        take: limit
       });
   
-      res.json({ history: transactions });
+      // Расчет общего количества страниц
+      const totalPages = Math.ceil(total / limit);
+  
+      // Формат ответа для фронтенд-пагинации
+      res.json({
+        history: transactions,
+        pagination: {
+          totalItems: total,
+          totalPages,
+          currentPage: page,
+          itemsPerPage: limit,
+          hasNextPage: page < totalPages,
+          hasPrevPage: page > 1
+        }
+      });
     } catch (error) {
       console.error("Error fetching history:", error);
       res.status(500).json({ error: "Failed to fetch history" });
