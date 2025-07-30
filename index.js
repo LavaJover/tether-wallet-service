@@ -181,14 +181,20 @@ AppDataSource.initialize().then(() => {
 
   // Разморозка и перевод средств (off-chain)
   app.post("/wallets/release", async (req, res) => {
-    const { traderId, orderId, rewardPercent = 0.01, platformFee = 0.02, merchantId } = req.body;
+    const { 
+      traderId, 
+      orderId, 
+      rewardPercent = 0.01, 
+      platformFee = 0.02, 
+      merchantId,
+      commissionUsers = [] 
+    } = req.body;
   
     try {
-      // Трейдерский кошелёк
+      // 1. Находим кошелек трейдера и замороженную транзакцию
       const traderWallet = await walletRepo.findOneBy({ traderId, currency: "USDT" });
       if (!traderWallet) return res.status(404).json({ error: "Trader wallet not found" });
   
-      // Замороженная транзакция
       const freezeTx = await txRepo.findOne({
         where: { orderId, type: "freeze" },
         order: { createdAt: "DESC" }, 
@@ -196,22 +202,54 @@ AppDataSource.initialize().then(() => {
       if (!freezeTx) return res.status(404).json({ error: "Freeze transaction not found" });
   
       const amount = freezeTx.amount;
-      const reward = parseFloat((amount * rewardPercent).toFixed(6));
-      const platformCut = parseFloat((amount * platformFee).toFixed(6));
-      const merchantAmount = parseFloat((amount - platformCut).toFixed(6));
+      
+      // 2. Валидация входных данных
+      if (commissionUsers.some(u => u.commission < 0 || u.commission > 1)) {
+        return res.status(400).json({ error: "Invalid commission value" });
+      }
+      
+      // 3. Расчет всех сумм
+      const platformCut = parseFloat((amount * platformFee).toFixed(6));          // Полный процент платформы
+      const merchantAmount = parseFloat((amount - platformCut).toFixed(6));       // Мерчант получает оставшуюся часть
+      
+      const reward = parseFloat((amount * rewardPercent).toFixed(6));             // Вознаграждение трейдера
+      
+      // Комиссии тим-лидов
+      let totalTeamCommissions = 0;
+      const teamCommissions = [];
+      for (const user of commissionUsers) {
+        const commissionAmount = parseFloat((amount * user.commission).toFixed(6));
+        totalTeamCommissions += commissionAmount;
+        teamCommissions.push({
+          userId: user.userId,
+          amount: commissionAmount
+        });
+      }
+      
+      // Чистая прибыль платформы
+      const platformProfit = parseFloat((
+        platformCut - reward - totalTeamCommissions
+      ).toFixed(6));
+      
+      // 4. Проверка корректности расчетов
+      if (platformProfit < 0) {
+        return res.status(400).json({ 
+          error: `Platform profit cannot be negative: ${platformProfit}`
+        });
+      }
   
-      // Списываем с замороженного трейдера и начисляем награду
+      // 5. Обновление баланса трейдера
       traderWallet.frozen -= amount;
       if (traderWallet.frozen < 0) traderWallet.frozen = 0;
-      traderWallet.balance += reward;
+      traderWallet.balance += reward;  // Начисляем вознаграждение
       await walletRepo.save(traderWallet);
   
-      // Логируем трейдерские транзакции
+      // 6. Логирование операций трейдера
       await txRepo.save(txRepo.create({
         traderId,
         currency: "USDT",
         type: "release",
-        amount,
+        amount: -amount,
         orderId,
         status: "confirmed",
       }));
@@ -224,14 +262,39 @@ AppDataSource.initialize().then(() => {
         status: "confirmed",
       }));
   
-      // Находим кошелёк мерчанта
+      // 7. Начисление комиссий тим-лидам
+      for (const commission of teamCommissions) {
+        const teamLeadWallet = await walletRepo.findOneBy({ 
+          traderId: commission.userId, 
+          currency: "USDT" 
+        });
+        
+        if (!teamLeadWallet) {
+          return res.status(404).json({ 
+            error: `Team lead wallet not found for user ${commission.userId}`
+          });
+        }
+  
+        teamLeadWallet.balance += commission.amount;
+        await walletRepo.save(teamLeadWallet);
+  
+        await txRepo.save(txRepo.create({
+          traderId: commission.userId,
+          currency: "USDT",
+          type: "team_lead_commission",
+          amount: commission.amount,
+          orderId,
+          status: "confirmed",
+        }));
+      }
+  
+      // 8. Начисление мерчанту
       const merchantWallet = await walletRepo.findOneBy({ traderId: merchantId, currency: "USDT" });
       if (!merchantWallet) return res.status(404).json({ error: "Merchant wallet not found" });
   
       merchantWallet.balance += merchantAmount;
       await walletRepo.save(merchantWallet);
   
-      // Логируем мерчантскую транзакцию
       await txRepo.save(txRepo.create({
         traderId: merchantId,
         currency: "USDT",
@@ -241,28 +304,46 @@ AppDataSource.initialize().then(() => {
         status: "confirmed",
       }));
   
-      // Логируем platform fee
+      // 9. Регистрация дохода платформы
+      // Находим системный кошелек платформы
+      const platformWallet = await walletRepo.findOneBy({ traderId: "platform", currency: "USDT" });
+      if (!platformWallet) return res.status(404).json({ error: "Platform wallet not found" });
+  
+      platformWallet.balance += platformProfit;
+      await walletRepo.save(platformWallet);
+  
       await txRepo.save(txRepo.create({
-        traderId, // можно traderId или специальный "platform" ID, если он у тебя есть
+        traderId: "platform",
         currency: "USDT",
-        type: "platform_fee",
-        amount: platformCut,
+        type: "platform_profit",
+        amount: platformProfit,
         orderId,
         status: "confirmed",
       }));
   
+      // 10. Возврат результата
       return res.json({
-        released: amount,
-        reward,
+        totalAmount: amount,
         merchantReceived: merchantAmount,
         platformFee: platformCut,
+        platformProfit: platformProfit,
+        traderReward: reward,
+        teamCommissions: teamCommissions.map(c => ({
+          userId: c.userId,
+          amount: c.amount
+        })),
+        distribution: {
+          merchant: parseFloat((merchantAmount / amount * 100).toFixed(2)) + '%',
+          platform: parseFloat((platformCut / amount * 100).toFixed(2)) + '%',
+          trader: parseFloat((reward / amount * 100).toFixed(2)) + '%',
+          teamLeads: parseFloat((totalTeamCommissions / amount * 100).toFixed(2)) + '%'
+        }
       });
     } catch (error) {
       console.error("Error releasing funds:", error);
       return res.status(500).json({ error: "Failed to release funds" });
     }
   });
-  
 
   // Вывод USDT (on-chain)
   app.post("/wallets/withdraw", async (req, res) => {

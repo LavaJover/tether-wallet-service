@@ -10,8 +10,8 @@ module.exports = new EntitySchema({
       generated: true,
     },
     traderId: {
-      type: 'uuid',
-      nullable: false,
+      type: 'varchar',
+      nullable: true,
     },
     currency: {
       type: 'varchar',
