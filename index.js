@@ -191,10 +191,11 @@ AppDataSource.initialize().then(() => {
     } = req.body;
   
     try {
-      // 1. Находим кошелек трейдера и замороженную транзакцию
+      // Трейдерский кошелёк
       const traderWallet = await walletRepo.findOneBy({ traderId, currency: "USDT" });
       if (!traderWallet) return res.status(404).json({ error: "Trader wallet not found" });
   
+      // Замороженная транзакция
       const freezeTx = await txRepo.findOne({
         where: { orderId, type: "freeze" },
         order: { createdAt: "DESC" }, 
@@ -203,12 +204,12 @@ AppDataSource.initialize().then(() => {
   
       const amount = freezeTx.amount;
       
-      // 2. Валидация входных данных
+      // Валидация входных данных
       if (commissionUsers.some(u => u.commission < 0 || u.commission > 1)) {
         return res.status(400).json({ error: "Invalid commission value" });
       }
       
-      // 3. Расчет всех сумм
+      // Расчет всех сумм
       const platformCut = parseFloat((amount * platformFee).toFixed(6));          // Полный процент платформы
       const merchantAmount = parseFloat((amount - platformCut).toFixed(6));       // Мерчант получает оставшуюся часть
       
@@ -216,14 +217,26 @@ AppDataSource.initialize().then(() => {
       
       // Комиссии тим-лидов
       let totalTeamCommissions = 0;
-      const teamCommissions = [];
-      for (const user of commissionUsers) {
-        const commissionAmount = parseFloat((amount * user.commission).toFixed(6));
-        totalTeamCommissions += commissionAmount;
-        teamCommissions.push({
-          userId: user.userId,
-          amount: commissionAmount
-        });
+      let teamCommissions = [];
+      
+      // Защита: проверяем, не превышают ли комиссии платформенный сбор
+      if (platformCut > 0) {
+        for (const user of commissionUsers) {
+          const commissionAmount = parseFloat((amount * user.commission).toFixed(6));
+          
+          // Проверяем, не превышает ли комиссия доступный остаток
+          if (commissionAmount <= platformCut) {
+            totalTeamCommissions += commissionAmount;
+            teamCommissions.push({
+              userId: user.userId,
+              amount: commissionAmount
+            });
+          } else {
+            console.warn(`Commission for user ${user.userId} exceeds platform cut: ${commissionAmount} > ${platformCut}`);
+          }
+        }
+      } else {
+        console.warn("Platform cut is zero, skipping team commissions");
       }
       
       // Чистая прибыль платформы
@@ -231,20 +244,23 @@ AppDataSource.initialize().then(() => {
         platformCut - reward - totalTeamCommissions
       ).toFixed(6));
       
-      // 4. Проверка корректности расчетов
+      // Проверка корректности расчетов
       if (platformProfit < 0) {
-        return res.status(400).json({ 
-          error: `Platform profit cannot be negative: ${platformProfit}`
-        });
+        // Корректируем прибыль платформы и сбрасываем комиссии
+        platformProfit = parseFloat((platformCut - reward).toFixed(6));
+        totalTeamCommissions = 0;
+        teamCommissions = [];
+        
+        console.warn("Team commissions exceed available platform funds. Skipping team payouts.");
       }
   
-      // 5. Обновление баланса трейдера
+      // Обновление баланса трейдера
       traderWallet.frozen -= amount;
       if (traderWallet.frozen < 0) traderWallet.frozen = 0;
-      traderWallet.balance += reward;  // Начисляем вознаграждение
+      traderWallet.balance += reward;
       await walletRepo.save(traderWallet);
   
-      // 6. Логирование операций трейдера
+      // Логирование операций трейдера
       await txRepo.save(txRepo.create({
         traderId,
         currency: "USDT",
@@ -262,7 +278,7 @@ AppDataSource.initialize().then(() => {
         status: "confirmed",
       }));
   
-      // 7. Начисление комиссий тим-лидам
+      // Начисление комиссий тим-лидам (только если прошли проверки)
       for (const commission of teamCommissions) {
         const teamLeadWallet = await walletRepo.findOneBy({ 
           traderId: commission.userId, 
@@ -270,9 +286,8 @@ AppDataSource.initialize().then(() => {
         });
         
         if (!teamLeadWallet) {
-          return res.status(404).json({ 
-            error: `Team lead wallet not found for user ${commission.userId}`
-          });
+          console.error(`Team lead wallet not found: ${commission.userId}`);
+          continue; // Пропускаем, но не прерываем процесс
         }
   
         teamLeadWallet.balance += commission.amount;
@@ -288,7 +303,7 @@ AppDataSource.initialize().then(() => {
         }));
       }
   
-      // 8. Начисление мерчанту
+      // Начисление мерчанту
       const merchantWallet = await walletRepo.findOneBy({ traderId: merchantId, currency: "USDT" });
       if (!merchantWallet) return res.status(404).json({ error: "Merchant wallet not found" });
   
@@ -304,8 +319,7 @@ AppDataSource.initialize().then(() => {
         status: "confirmed",
       }));
   
-      // 9. Регистрация дохода платформы
-      // Находим системный кошелек платформы
+      // Регистрация дохода платформы
       const platformWallet = await walletRepo.findOneBy({ traderId: "platform", currency: "USDT" });
       if (!platformWallet) return res.status(404).json({ error: "Platform wallet not found" });
   
@@ -321,7 +335,7 @@ AppDataSource.initialize().then(() => {
         status: "confirmed",
       }));
   
-      // 10. Возврат результата
+      // Возврат результата
       return res.json({
         totalAmount: amount,
         merchantReceived: merchantAmount,
@@ -332,6 +346,7 @@ AppDataSource.initialize().then(() => {
           userId: c.userId,
           amount: c.amount
         })),
+        commissionsSkipped: commissionUsers.length - teamCommissions.length,
         distribution: {
           merchant: parseFloat((merchantAmount / amount * 100).toFixed(2)) + '%',
           platform: parseFloat((platformCut / amount * 100).toFixed(2)) + '%',
@@ -640,6 +655,45 @@ AppDataSource.initialize().then(() => {
     } catch (error) {
       console.error("Error deleting withdrawal rule:", error);
       res.status(500).json({ error: "Failed to delete withdrawal rule" });
+    }
+  });
+
+  app.post("/wallets/commission-profit", async (req, res) => {
+    const { traderId, from, to } = req.body;
+  
+    // Проверка обязательных параметров
+    if (!traderId || !from || !to) {
+      return res.status(400).json({
+        error: "Missing required parameters: traderId, from, or to"
+      });
+    }
+  
+    try {
+      // Выполняем запрос к базе данных
+      const result = await txRepo
+        .createQueryBuilder("tx")
+        .select("SUM(tx.amount)", "totalCommission")
+        .where("tx.traderId = :traderId", { traderId })
+        .andWhere("tx.type = :type", { type: "team_lead_commission" })
+        .andWhere("tx.createdAt BETWEEN :from AND :to", { from, to })
+        .getRawOne();
+  
+      // Извлекаем результат (может быть null если нет транзакций)
+      const totalCommission = parseFloat(result.totalCommission || 0);
+  
+      return res.json({
+        traderId,
+        from,
+        to,
+        totalCommission,
+        currency: "USDT"
+      });
+    } catch (error) {
+      console.error("Error calculating commission profit:", error);
+      return res.status(500).json({
+        error: "Failed to calculate commission profit",
+        details: error.message
+      });
     }
   });
   
